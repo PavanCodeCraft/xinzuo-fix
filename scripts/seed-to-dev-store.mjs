@@ -144,9 +144,135 @@ if (WRITE && WIPE) {
     try { await api('DELETE', `blogs/${a.blog_id}/articles/${a.id}.json`); } catch {}
   }
   console.log(`  deleted ${existing.articles.length} articles`);
+  // Also wipe Files (uploaded theme images) so re-runs don't accumulate dupes.
+  // Use GraphQL fileDelete since REST doesn't expose Files.
+  async function gqlWipe(query, variables) {
+    const r = await fetch(`${BASE}/admin/api/2024-10/graphql.json`, {
+      method: 'POST',
+      headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables }),
+    });
+    if (!r.ok) throw new Error(`graphql ${r.status}`);
+    const j = await r.json();
+    if (j.errors) throw new Error(JSON.stringify(j.errors));
+    return j.data;
+  }
+  let fileCursor = null, allFileIds = [];
+  while (true) {
+    const data = await gqlWipe(`query($cursor: String) { files(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } edges { node { id } } } }`, { cursor: fileCursor });
+    allFileIds.push(...data.files.edges.map((e) => e.node.id));
+    if (!data.files.pageInfo.hasNextPage) break;
+    fileCursor = data.files.pageInfo.endCursor;
+  }
+  if (allFileIds.length) {
+    // fileDelete accepts up to ~250 IDs per call
+    for (let i = 0; i < allFileIds.length; i += 100) {
+      const batch = allFileIds.slice(i, i + 100);
+      await gqlWipe(`mutation($ids: [ID!]!) { fileDelete(fileIds: $ids) { userErrors { field message } } }`, { ids: batch });
+    }
+  }
+  console.log(`  deleted ${allFileIds.length} files`);
 }
 
-const created = { products: 0, collections: 0, pages: 0, blogs: 0, articles: 0 };
+const created = { media: 0, products: 0, collections: 0, pages: 0, blogs: 0, articles: 0 };
+
+// --- MEDIA: upload theme images to dev-store Files (must happen BEFORE theme push) ---
+// The theme JSON references images by shopify://shop_images/{filename}. Those refs
+// resolve at storefront render time by looking up filename in the store's Files.
+// If we don't upload these, the logo, hero, testimonials, icons, etc. all render as empty.
+const mediaManifestPath = path.join(process.cwd(), 'media-manifest.json');
+const mediaDir = path.join(process.cwd(), 'media');
+if (existsSync(mediaManifestPath) && existsSync(mediaDir)) {
+  const manifest = JSON.parse(readFileSync(mediaManifestPath, 'utf-8'));
+  const files = manifest.files ?? [];
+  console.log(`\n=== Media (${files.length} images) ===`);
+  if (WRITE) {
+    // GraphQL endpoint for staged uploads + fileCreate
+    async function gql(query, variables) {
+      while (true) {
+        const r = await fetch(`${BASE}/admin/api/2024-10/graphql.json`, {
+          method: 'POST',
+          headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, variables }),
+        });
+        if (r.status === 429) {
+          await sleep(parseFloat(r.headers.get('retry-after') || '2') * 1000);
+          continue;
+        }
+        if (!r.ok) throw new Error(`graphql ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        const j = await r.json();
+        if (j.errors) throw new Error(JSON.stringify(j.errors));
+        return j.data;
+      }
+    }
+    // List existing files on dev store so --wipe-equivalent (idempotent) skipping works:
+    // we re-upload by filename even if present (Shopify creates a new version).
+    const mimeByExt = { webp: 'image/webp', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif' };
+    const uploadedIds = [];
+    const res = await pool(files, async (entry) => {
+      const localPath = path.join(mediaDir, entry.filename);
+      // (concurrency=8 below)
+      if (!existsSync(localPath)) throw new Error(`local missing: ${entry.filename}`);
+      const buf = readFileSync(localPath);
+      const ext = path.extname(entry.filename).slice(1).toLowerCase();
+      const mime = mimeByExt[ext] || 'application/octet-stream';
+      // 1) staged upload
+      const staged = await gql(`mutation($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+          stagedTargets { url resourceUrl parameters { name value } }
+          userErrors { field message }
+        }
+      }`, { input: [{ filename: entry.filename, mimeType: mime, httpMethod: 'POST', resource: 'FILE', fileSize: String(buf.byteLength) }] });
+      const errs1 = staged.stagedUploadsCreate.userErrors;
+      if (errs1.length) throw new Error(`staged: ${JSON.stringify(errs1)}`);
+      const target = staged.stagedUploadsCreate.stagedTargets[0];
+      // 2) POST to storage URL
+      const fd = new FormData();
+      for (const p of target.parameters) fd.append(p.name, p.value);
+      fd.append('file', new Blob([buf], { type: mime }), entry.filename);
+      const upRes = await fetch(target.url, { method: 'POST', body: fd });
+      if (!upRes.ok && upRes.status !== 201) throw new Error(`storage upload ${upRes.status}`);
+      // 3) fileCreate
+      const created = await gql(`mutation($files: [FileCreateInput!]!) {
+        fileCreate(files: $files) {
+          files { id alt fileStatus }
+          userErrors { field message code }
+        }
+      }`, { files: [{ originalSource: target.resourceUrl, contentType: ext === 'svg' ? 'FILE' : 'IMAGE', filename: entry.filename }] });
+      const errs2 = created.fileCreate.userErrors;
+      if (errs2.length) throw new Error(`fileCreate: ${JSON.stringify(errs2)}`);
+      uploadedIds.push(created.fileCreate.files[0].id);
+    }, 8);
+    created.media = res.ok;
+    console.log(`  ${res.ok} uploaded, ${res.fail} failed`);
+    // Wait for all uploads to be READY before continuing. By the time we get here,
+    // most have already processed (Shopify is usually <1s per image), so poll quickly.
+    if (uploadedIds.length) {
+      console.log(`  waiting for files to be READY...`);
+      // Batch in groups of 50 to stay under GraphQL cost limit
+      const start = Date.now();
+      let allReady = false;
+      for (let i = 0; i < 20; i++) {
+        await sleep(1500);
+        let ready = 0, failed = 0;
+        for (let off = 0; off < uploadedIds.length; off += 50) {
+          const batch = uploadedIds.slice(off, off + 50);
+          const queryNodes = batch.map((id, j) => `n${j}: node(id: "${id}") { ... on MediaImage { fileStatus } ... on File { fileStatus } }`).join('\n');
+          const q = await gql(`query { ${queryNodes} }`, {});
+          for (const n of Object.values(q)) {
+            if (n?.fileStatus === 'READY') ready++;
+            else if (n?.fileStatus === 'FAILED') failed++;
+          }
+        }
+        if (i % 2 === 0) console.log(`    ready: ${ready}/${uploadedIds.length} (${Math.round((Date.now() - start) / 1000)}s)`);
+        if (ready + failed === uploadedIds.length) { allReady = true; break; }
+      }
+      if (!allReady) console.log(`  ⚠ some files still processing — theme may show empty images on first load`);
+    }
+  } else created.media = files.length;
+} else {
+  console.log('\n(No media-manifest.json or media/ dir — skipping image upload. Theme will have empty image fields.)');
+}
 
 // --- PRODUCTS (parallel) ---
 console.log(`\n=== Products (${productsToCreate.length}) ===`);

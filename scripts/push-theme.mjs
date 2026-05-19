@@ -106,18 +106,127 @@ const created = await api('POST', 'themes.json', { theme: { name: themeName, rol
 const themeId = created.theme.id;
 console.log(`Theme id=${themeId} name=${themeName}`);
 
-// --- Phased concurrent upload ---
-// Strip references to media files that exist in xinzuo's Shopify Files
-// but won't exist on the applicant's fresh dev store.
-// Theme JSON templates often contain `"video": "shopify://shop_files/12345"` which
-// Shopify rejects at upload if the file doesn't exist. Set those to empty strings.
-function scrubShopFileRefs(text) {
-  // Strip any shopify:// references in JSON config — they point at files in xinzuo's
-  // Shopify Files that don't exist on the applicant's fresh dev store, and Shopify
-  // rejects them at upload. JSON encodes / as \/ so we match both forms.
-  // Covers shopify://files/..., shopify://shop_files/..., shopify://shop_images/...
+// --- Build ref-rewrite table from media-manifest.json (produced by export-xinzuo-media.mjs
+//     and bundled with the snapshot repo). Maps origRef (e.g. shopify://shop_images/foo.png)
+//     to newRef (e.g. shopify://shop_images/foo.webp) after local webp conversion.
+const manifestPath = path.join(process.cwd(), 'media-manifest.json');
+const refMap = new Map();
+if (existsSync(manifestPath)) {
+  const mf = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+  for (const e of mf.files) refMap.set(e.origRef, e.newRef);
+  console.log(`Loaded media-manifest: ${refMap.size} ref rewrites`);
+} else {
+  console.log('No media-manifest.json — image refs will be scrubbed.');
+}
+
+// Rewrite theme JSON: rewrite shop_images refs, scrub video/file refs, REMOVE app blocks.
+// App blocks (shopify://apps/...) can't be scrubbed to "" because block.type can't be empty;
+// they must be structurally removed from blocks{} and block_order[].
+//
+// Parse the JSON, walk it recursively, then re-serialize. This is safer than regex for
+// nested data and avoids the orphan-scrub-undoing-rewrites trap.
+// Sentinel: any value rewritten to this marker is then *removed* from its parent in
+// rewriteImageRefsInJson (we delete the setting key entirely rather than leaving "",
+// because some setting types — e.g. `video` — fail validation on empty strings).
+const DELETE = Symbol('delete-setting');
+
+function rewriteImageRefValue(v) {
+  if (typeof v !== 'string') return v;
+  // shopify://shop_images/X or shopify://shop_files/X → manifest newRef or DELETE
+  let m = v.match(/^shopify:\/\/(shop_images|shop_files)\/(.+)$/);
+  if (m) {
+    const orig = `shopify://${m[1]}/${m[2]}`;
+    return refMap.get(orig) ?? DELETE;
+  }
+  // shopify://files/* → DELETE (videos and other ad-hoc uploaded files we don't ship)
+  if (v.startsWith('shopify://files/')) return DELETE;
+  return v;
+}
+
+function isAppType(t) {
+  return typeof t === 'string' && t.startsWith('shopify://apps/');
+}
+
+// Remove app-block entries from a `blocks` object and its sibling `block_order` array.
+// Mutates in place. Recurses into nested `blocks` (a block can contain its own blocks).
+function pruneAppBlocks(node) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) { for (const item of node) pruneAppBlocks(item); return; }
+  if (node.blocks && typeof node.blocks === 'object' && !Array.isArray(node.blocks)) {
+    const removed = [];
+    for (const [key, val] of Object.entries(node.blocks)) {
+      if (val && typeof val === 'object' && isAppType(val.type)) {
+        removed.push(key);
+        delete node.blocks[key];
+      } else {
+        pruneAppBlocks(val);
+      }
+    }
+    if (removed.length && Array.isArray(node.block_order)) {
+      node.block_order = node.block_order.filter((k) => !removed.includes(k));
+    }
+  }
+  // Also remove top-level app-typed sections from a `sections` object
+  if (node.sections && typeof node.sections === 'object' && !Array.isArray(node.sections)) {
+    const removed = [];
+    for (const [key, val] of Object.entries(node.sections)) {
+      if (val && typeof val === 'object' && isAppType(val.type)) {
+        removed.push(key);
+        delete node.sections[key];
+      } else {
+        pruneAppBlocks(val);
+      }
+    }
+    if (removed.length && Array.isArray(node.order)) {
+      node.order = node.order.filter((k) => !removed.includes(k));
+    }
+  }
+  // Recurse into other object children
+  for (const [k, v] of Object.entries(node)) {
+    if (k === 'blocks' || k === 'sections') continue;
+    if (v && typeof v === 'object') pruneAppBlocks(v);
+  }
+}
+
+// Walk every string value in the JSON and rewrite image refs.
+// If rewriteImageRefValue returns the DELETE sentinel, drop the parent key entirely
+// (so e.g. "video" settings that can't be empty just disappear and Shopify uses the default).
+function rewriteImageRefsInJson(node) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      if (typeof node[i] === 'string') {
+        const rv = rewriteImageRefValue(node[i]);
+        node[i] = rv === DELETE ? '' : rv;
+      } else if (node[i] && typeof node[i] === 'object') rewriteImageRefsInJson(node[i]);
+    }
+    return;
+  }
+  for (const [k, v] of Object.entries(node)) {
+    if (typeof v === 'string') {
+      const rv = rewriteImageRefValue(v);
+      if (rv === DELETE) delete node[k];
+      else node[k] = rv;
+    } else if (v && typeof v === 'object') rewriteImageRefsInJson(v);
+  }
+}
+
+// Shopify-generated JSON files use JSON5 conventions: leading /* ... */ comments,
+// and trailing commas before } or ]. Normalise both before parsing.
+function stripJsonComments(text) {
   return text
-    .replace(/"shopify:(?:\\\/|\/)(?:\\\/|\/)(?:shop_files|shop_images|files)(?:\\\/|\/)[^"]+"/g, '""');
+    .replace(/^\s*\/\*[\s\S]*?\*\//, '')
+    .replace(/,(\s*[}\]])/g, '$1');
+}
+
+function rewriteRefs(text) {
+  const stripped = stripJsonComments(text);
+  let data;
+  try { data = JSON.parse(stripped); }
+  catch { return text; }  // Not a JSON file we can parse — return original
+  pruneAppBlocks(data);
+  rewriteImageRefsInJson(data);
+  return JSON.stringify(data, null, 2);
 }
 
 async function uploadFile(f) {
@@ -125,8 +234,7 @@ async function uploadFile(f) {
   let value;
   if (f.isText) {
     value = buf.toString('utf-8');
-    // Scrub only JSON files (template configs); leave Liquid/CSS/JS unchanged
-    if (f.key.endsWith('.json')) value = scrubShopFileRefs(value);
+    if (f.key.endsWith('.json')) value = rewriteRefs(value);
   }
   const asset = f.isText
     ? { key: f.key, value }
