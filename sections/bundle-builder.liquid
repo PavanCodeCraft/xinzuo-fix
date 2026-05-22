@@ -80,7 +80,12 @@
         <p class="bundle-builder__subheading">{{ section.settings.subheading }}</p>
       {%- endif -%}
       <div class="bundle-builder__progress" ref="progressText">
-        Select at least {{ min_items }} items to unlock your discount (15%)
+       {%- assign first_tier = section.blocks | where: "type", "discount_tier" | first -%}
+       {%- if first_tier -%}
+          Select at least {{ first_tier.settings.min_items }} items to unlock {{ first_tier.settings.discount_percent }}% off
+        {%- else -%}
+          Select at least {{ min_items }} items to unlock your discount
+{%- endif -%}
       </div>
     </div>
 
